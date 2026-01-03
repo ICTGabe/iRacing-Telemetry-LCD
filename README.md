@@ -24,3 +24,12 @@ usage of the script:
 python3 iracing_udp_bridge.py (normal logging with csv)        
 python3 iracing_udp_bridge.py -l (live without logging)     
 ```    
+
+
+pictures of dashes:      
+![First dash](images/1.jpg)    
+![2nd](images/2.jpg)     
+![3rd](images/3.jpg)     
+![4th](images/4.jpg)     
+![5th](images/5.jpg)     
+![6th](images/6.jpg)     
