@@ -22,14 +22,14 @@ WiFiUDP udp;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ---------- Button ----------
-static const int BTN_PIN = 27;           // your GPIO27
+static const int BTN_PIN = 27;           // your GPIO27 (other side to GND)
 static const uint32_t DEBOUNCE_MS = 35;
 static int lastBtnRead = HIGH;
 static int stableBtn = HIGH;
 static uint32_t lastDebounceMs = 0;
 
 // ---------- Pages ----------
-static const uint8_t NUM_PAGES = 5;
+static const uint8_t NUM_PAGES = 6;
 static uint8_t uiPage = 0;
 
 // ---------- Telemetry state ----------
@@ -39,9 +39,11 @@ struct Telemetry {
   int gear = 0;
   float thr = 0;       // 0..1
   float brk = 0;       // 0..1
-  float steer = 0;     // -1..1 (unused)
-  float fuel_l = 0;    // liters (may be 0 in replay)
-  float fuel_pct = 0;  // 0..1
+
+  float session_remain_s = 0; // seconds (from PC)
+  float fuel_l = 0;           // liters
+  int incidents = 0;
+
   float speed_kmh = 0;
 
   int lap = 0;
@@ -86,7 +88,6 @@ static float totalFuelUsed = 0.0f;
 static int fuelLapsCounted = 0;
 
 static void updateFuelLapStats() {
-  // Only meaningful if we have real liters
   if (t.fuel_l <= 0.001f) return;
   if (t.lap <= 0) return;
 
@@ -97,16 +98,14 @@ static void updateFuelLapStats() {
   }
 
   if (t.lap != lastLapSeen) {
-    // lap changed => compute previous lap consumption
     float used = fuelAtLapStart - t.fuel_l;
 
-    // Filter out refuel / nonsense (negative or huge spikes)
+    // Filter out refuel / nonsense
     if (used > 0.0f && used < 10.0f) {
       lastLapFuelUsed = used;
       totalFuelUsed += used;
       fuelLapsCounted++;
     } else {
-      // If we refueled (pit) we reset baseline, but keep existing averages
       lastLapFuelUsed = 0.0f;
     }
 
@@ -118,6 +117,29 @@ static void updateFuelLapStats() {
 static float avgLapFuelUsed() {
   if (fuelLapsCounted <= 0) return 0.0f;
   return totalFuelUsed / (float)fuelLapsCounted;
+}
+
+static float estLapTime() {
+  if (t.lap_last > 0.1f) return t.lap_last;
+  if (t.lap_best > 0.1f) return t.lap_best;
+  return 0.0f;
+}
+
+static float fuelNeededToFinish() {
+  float avg = avgLapFuelUsed();
+  float lapT = estLapTime();
+  if (avg <= 0.0001f) return -1.0f;
+  if (lapT <= 0.1f) return -1.0f;
+  if (t.session_remain_s <= 1.0f) return -1.0f;
+
+  float lapsRemain = t.session_remain_s / lapT;
+
+  // Small margin so it doesn't under-estimate
+  lapsRemain += 0.5f;
+
+  float need = lapsRemain * avg;
+  if (need < 0.0f) need = 0.0f;
+  return need;
 }
 
 // ---------- Drawing helpers ----------
@@ -231,8 +253,9 @@ static void connectWiFi() {
 }
 
 static bool parseCsvPacket(char* buf) {
-  // 15-field payload:
-  // seq,rpm,gear,thr,brk,steer,fuel_l,fuel_pct,speed_kmh,lap,pos,class_pos,lap_cur,lap_last,lap_best
+  // 15-field payload (NEW ORDER):
+  // seq,rpm,gear,thr,brk,session_remain_s,fuel_l,incidents,speed_kmh,lap,pos,class_pos,lap_cur,lap_last,lap_best
+
   char* saveptr = nullptr;
   char* tok = strtok_r(buf, ",", &saveptr);
   if (!tok) return false;
@@ -250,9 +273,11 @@ static bool parseCsvPacket(char* buf) {
   t.gear = (int)v[2];
   t.thr = v[3];
   t.brk = v[4];
-  t.steer = v[5];
+
+  t.session_remain_s = v[5];
   t.fuel_l = v[6];
-  t.fuel_pct = v[7];
+  t.incidents = (int)v[7];
+
   t.speed_kmh = v[8];
 
   t.lap = (int)v[9];
@@ -297,9 +322,85 @@ static void drawNoData() {
   display.print("Start PC bridge");
 }
 
-// ---------- Pages ----------
+// ---------- Page 6: RPM + shift lights + gear ----------
+static const float RPM_MAX   = 9000.0f;
+static const float RPM_SHIFT = 8500.0f;
+static const int   RPM_LIGHTS = 10;
+
+static void gearToStr(char* out, size_t n, int g) {
+  if (g < 0) snprintf(out, n, "R");
+  else if (g == 0) snprintf(out, n, "N");
+  else snprintf(out, n, "%d", g);
+}
+
+static void drawShiftLights(float rpm) {
+  const int w = 10;
+  const int h = 8;
+  const int gap = 2;
+  const int total = RPM_LIGHTS * w + (RPM_LIGHTS - 1) * gap;
+  const int x0 = (128 - total) / 2;
+  const int y0 = 14;
+
+  float pct = rpm / RPM_MAX;
+  pct = constrain(pct, 0.0f, 1.0f);
+
+  int lit = (int)(pct * RPM_LIGHTS + 0.0001f);
+  if (lit > RPM_LIGHTS) lit = RPM_LIGHTS;
+
+  bool blink = (rpm >= RPM_SHIFT);
+  bool blinkOn = ((millis() / 150) % 2) == 0;
+
+  for (int i = 0; i < RPM_LIGHTS; i++) {
+    int x = x0 + i * (w + gap);
+    display.drawRect(x, y0, w, h, SSD1306_WHITE);
+
+    bool shouldFill = (i < lit);
+    if (blink && i >= (RPM_LIGHTS - 3)) {
+      shouldFill = shouldFill && blinkOn;
+    }
+    if (shouldFill) {
+      display.fillRect(x + 1, y0 + 1, w - 2, h - 2, SSD1306_WHITE);
+    }
+  }
+}
+
+static void drawRpmBar(float rpm) {
+  const int x = 0, y = 26, w = 128, h = 8;
+  display.drawRect(x, y, w, h, SSD1306_WHITE);
+
+  float pct = rpm / RPM_MAX;
+  pct = constrain(pct, 0.0f, 1.0f);
+
+  int fillW = (int)((w - 2) * pct);
+  display.fillRect(x + 1, y + 1, fillW, h - 2, SSD1306_WHITE);
+}
+
+static void drawPageRpmShift() {
+  drawShiftLights(t.rpm);
+  drawRpmBar(t.rpm);
+
+  display.setTextSize(1);
+  display.setCursor(0, 38);
+  display.print("RPM");
+
+  display.setTextSize(2);
+  display.setCursor(0, 46);
+  display.print((int)t.rpm);
+
+  char gbuf[4];
+  gearToStr(gbuf, sizeof(gbuf), t.gear);
+
+  display.setTextSize(1);
+  display.setCursor(94, 38);
+  display.print("GEAR");
+
+  display.setTextSize(3);
+  display.setCursor(96, 44);
+  display.print(gbuf);
+}
+
+// ---------- Pages (LIVE) ----------
 static void drawPageGraphs() {
-  // Page 1: THR/BRK graphs
   const int gx = 0, gy = 18, gw = 62, gh = 38;
 
   drawGraphBox(gx, gy, gw, gh, "THR");
@@ -321,7 +422,6 @@ static void drawPageGraphs() {
 }
 
 static void drawPageBarsGearFuel() {
-  // Page 2: bars + gear + speed + fuel
   drawGearBox(0, 14, 44, 34, t.gear);
 
   display.setTextSize(2);
@@ -331,7 +431,7 @@ static void drawPageBarsGearFuel() {
   display.setCursor(52, 34);
   display.print("km/h");
 
-  // Fuel (liters if available, else percent)
+  // Fuel always as liters (as requested)
   display.setTextSize(1);
   display.setCursor(92, 16);
   display.print("FUEL");
@@ -340,8 +440,7 @@ static void drawPageBarsGearFuel() {
     display.print(t.fuel_l, 1);
     display.print("L");
   } else {
-    display.print((int)(constrain(t.fuel_pct, 0.0f, 1.0f) * 100));
-    display.print("%");
+    display.print("--.-L");
   }
 
   drawBarSimple(0, 52, 62, 10, t.thr, "THR");
@@ -349,35 +448,39 @@ static void drawPageBarsGearFuel() {
 }
 
 static void drawPageFuelStats() {
-  // Page 3: Fuel stats
+  // Page 3: show fuel needed to finish (instead of "Fuel now %")
+  float need = fuelNeededToFinish();
+
   display.setTextSize(1);
   display.setCursor(0, 14);
-  display.print("Fuel now:");
+  display.print("Need fuel:");
 
   display.setTextSize(2);
   display.setCursor(0, 24);
-  if (t.fuel_l > 0.01f) {
-    display.print(t.fuel_l, 1);
+  if (need >= 0.0f) {
+    display.print(need, 1);
     display.print(" L");
   } else {
-    display.print((int)(constrain(t.fuel_pct, 0.0f, 1.0f) * 100));
-    display.print(" %");
+    display.print("--.- L");
   }
 
   display.setTextSize(1);
   display.setCursor(0, 46);
-  display.print("Last lap used: ");
-  display.print(lastLapFuelUsed, 2);
-  display.print("L");
+  display.print("Fuel now: ");
+  if (t.fuel_l > 0.01f) {
+    display.print(t.fuel_l, 1);
+    display.print("L");
+  } else {
+    display.print("--.-L");
+  }
 
   display.setCursor(0, 56);
-  display.print("Avg / lap:     ");
+  display.print("Avg/lap:  ");
   display.print(avgLapFuelUsed(), 2);
   display.print("L");
 }
 
 static void drawPageLapTimes() {
-  // Page 4: lap timer
   char buf[16];
 
   display.setTextSize(1);
@@ -402,40 +505,197 @@ static void drawPageLapTimes() {
 }
 
 static void drawPagePositionLap() {
-  // Page 5: position + lap
+  // Page 5: add incidents
   display.setTextSize(2);
-  display.setCursor(0, 16);
+  display.setCursor(0, 14);
   display.print("P ");
   display.print(t.pos);
 
   display.setTextSize(1);
-  display.setCursor(0, 38);
+  display.setCursor(0, 36);
   display.print("Class P: ");
   display.print(t.class_pos);
 
-  display.setCursor(0, 50);
+  display.setCursor(0, 48);
   display.print("Lap: ");
   display.print(t.lap);
+
+  display.setCursor(70, 48);
+  display.print("Inc: ");
+  display.print(t.incidents);
 }
 
+// ---------- Demo mode (when not live, for pages 2..6 only) ----------
+static void demoValues(float &rpm, int &gear, float &thr, float &brk, float &speed, float &fuel, int &pos, int &cls, int &lap, int &inc) {
+  uint32_t ms = millis();
+
+  // simple wavey demo
+  float phase = (ms % 6000) / 6000.0f;           // 0..1
+  float p2 = (ms % 2000) / 2000.0f;              // 0..1
+
+  rpm = 1500.0f + 7000.0f * phase;               // 1500..8500
+  if (rpm > 9000.0f) rpm = 9000.0f;
+
+  gear = 1 + (int)(phase * 6.0f);                // 1..7-ish
+  if (gear > 6) gear = 6;
+
+  thr = 0.2f + 0.8f * (phase < 0.8f ? phase / 0.8f : 1.0f);
+  thr = constrain(thr, 0.0f, 1.0f);
+
+  brk = (p2 > 0.8f) ? (p2 - 0.8f) / 0.2f : 0.0f; // occasional braking
+  brk = constrain(brk, 0.0f, 1.0f);
+
+  speed = 40.0f + 240.0f * phase;                // 40..280
+  fuel = 42.0f - 10.0f * phase;                  // 42..32
+  if (fuel < 0) fuel = 0;
+
+  pos = 7;
+  cls = 3;
+  lap = 12;
+  inc = 2;
+}
+
+static void drawDemoPage(uint8_t page) {
+  float rpm, thr, brk, speed, fuel;
+  int gear, pos, cls, lap, inc;
+  demoValues(rpm, gear, thr, brk, speed, fuel, pos, cls, lap, inc);
+
+  switch (page) {
+    case 1: { // Bars+Gear+Fuel demo
+      drawGearBox(0, 14, 44, 34, gear);
+
+      display.setTextSize(2);
+      display.setCursor(52, 16);
+      display.print((int)speed);
+      display.setTextSize(1);
+      display.setCursor(52, 34);
+      display.print("km/h");
+
+      display.setTextSize(1);
+      display.setCursor(92, 16);
+      display.print("FUEL");
+      display.setCursor(92, 26);
+      display.print(fuel, 1);
+      display.print("L");
+
+      drawBarSimple(0, 52, 62, 10, thr, "THR");
+      drawBarSimple(66, 52, 62, 10, brk, "BRK");
+    } break;
+
+    case 2: { // Fuel stats demo
+      display.setTextSize(1);
+      display.setCursor(0, 14);
+      display.print("Need fuel:");
+
+      display.setTextSize(2);
+      display.setCursor(0, 24);
+      display.print("18.6 L");
+
+      display.setTextSize(1);
+      display.setCursor(0, 46);
+      display.print("Fuel now: ");
+      display.print(fuel, 1);
+      display.print("L");
+
+      display.setCursor(0, 56);
+      display.print("Avg/lap:  3.10L");
+    } break;
+
+    case 3: { // Lap times demo
+      display.setTextSize(1);
+      display.setCursor(0, 14);
+      display.print("Current:");
+
+      display.setTextSize(2);
+      display.setCursor(0, 24);
+      display.print("1:58.432");
+
+      display.setTextSize(1);
+      display.setCursor(0, 46);
+      display.print("Last: 1:57.981");
+
+      display.setCursor(0, 56);
+      display.print("Best: 1:57.640");
+    } break;
+
+    case 4: { // Position/Lap/Inc demo
+      display.setTextSize(2);
+      display.setCursor(0, 14);
+      display.print("P ");
+      display.print(pos);
+
+      display.setTextSize(1);
+      display.setCursor(0, 36);
+      display.print("Class P: ");
+      display.print(cls);
+
+      display.setCursor(0, 48);
+      display.print("Lap: ");
+      display.print(lap);
+
+      display.setCursor(70, 48);
+      display.print("Inc: ");
+      display.print(inc);
+    } break;
+
+    case 5: { // RPM demo
+      // temporarily set to demo values
+      drawShiftLights(rpm);
+      drawRpmBar(rpm);
+
+      display.setTextSize(1);
+      display.setCursor(0, 38);
+      display.print("RPM");
+
+      display.setTextSize(2);
+      display.setCursor(0, 46);
+      display.print((int)rpm);
+
+      char gbuf[4];
+      gearToStr(gbuf, sizeof(gbuf), gear);
+
+      display.setTextSize(1);
+      display.setCursor(94, 38);
+      display.print("GEAR");
+
+      display.setTextSize(3);
+      display.setCursor(96, 44);
+      display.print(gbuf);
+    } break;
+
+    default:
+      break;
+  }
+}
+
+// ---------- UI ----------
 static void drawUI() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
   drawTopBar();
 
-  if (!isLive()) {
-    drawNoData();
+  bool live = isLive();
+
+  // Only page 1 (uiPage==0) shows "NO DATA". Other pages show demo until live.
+  if (!live) {
+    if (uiPage == 0) {
+      drawNoData();
+    } else {
+      drawDemoPage(uiPage);
+    }
     display.display();
     return;
   }
 
+  // Live rendering
   switch (uiPage) {
     case 0: drawPageGraphs(); break;
     case 1: drawPageBarsGearFuel(); break;
     case 2: drawPageFuelStats(); break;
     case 3: drawPageLapTimes(); break;
     case 4: drawPagePositionLap(); break;
+    case 5: drawPageRpmShift(); break;
   }
 
   display.display();
@@ -455,7 +715,6 @@ static void handleButton() {
     if (reading != stableBtn) {
       stableBtn = reading;
       if (stableBtn == LOW) {
-        // pressed
         uiPage = (uiPage + 1) % NUM_PAGES;
       }
     }

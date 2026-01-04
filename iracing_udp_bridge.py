@@ -1,13 +1,16 @@
+#!/usr/bin/env python3
 import argparse
 import csv
 import socket
 import time
+from dataclasses import dataclass
 from datetime import datetime
+from typing import List, Optional, Tuple
 
 import irsdk  # from pyirsdk
 
 PC_IP = "192.168.1.80"       # unused, ok to keep
-ESP32_IP = "192.168.1.60"    # must match your ESP sketch
+ESP32_IP = "192.168.1.60"
 ESP32_PORT = 5005
 
 SEND_HZ = 20.0
@@ -40,14 +43,82 @@ def norm_pct(x):
         return 0.0
     if x > 1.5:
         x = x / 100.0
-    if x < 0.0:
-        x = 0.0
-    if x > 1.0:
-        x = 1.0
-    return x
+    return max(0.0, min(1.0, x))
 
 
-def run(live_only: bool):
+def get_session_time_remain(ir) -> float:
+    """
+    Prefer SessionTimeRemain. If missing/0, try SessionTimeTotal - SessionTime.
+    Returns seconds (>= 0).
+    """
+    remain = ir_get(ir, "SessionTimeRemain", None)
+    try:
+        if remain is not None:
+            remain = float(remain)
+            if remain > 0.0:
+                return remain
+    except Exception:
+        pass
+
+    total = float(ir_get(ir, "SessionTimeTotal", 0.0))
+    cur = float(ir_get(ir, "SessionTime", 0.0))
+    if total > 0.0 and cur >= 0.0:
+        return max(0.0, total - cur)
+
+    return 0.0
+
+
+def get_incidents(ir) -> int:
+    """
+    Try common iRacing variables for incident points.
+    """
+    for key in ("PlayerCarMyIncidentCount", "PlayerCarTeamIncidentCount", "PlayerCarIncidentCount"):
+        val = ir_get(ir, key, None)
+        if val is None:
+            continue
+        try:
+            return int(val)
+        except Exception:
+            continue
+    return 0
+
+
+@dataclass
+class Dest:
+    host: str
+    port: int
+    resolved_ip: Optional[str] = None
+    last_resolve: float = 0.0
+
+    def resolve(self, interval_s: float = 5.0) -> Optional[Tuple[str, int]]:
+        now = time.time()
+        if self.resolved_ip is None or (now - self.last_resolve) > interval_s:
+            try:
+                self.resolved_ip = socket.gethostbyname(self.host)
+                self.last_resolve = now
+            except Exception:
+                self.resolved_ip = None
+                self.last_resolve = now
+        if self.resolved_ip is None:
+            return None
+        return (self.resolved_ip, self.port)
+
+
+def parse_dest(s: str) -> Dest:
+    """
+    Accept:
+      - "ip"
+      - "ip:port"
+      - "hostname"
+      - "hostname:port"
+    """
+    if ":" in s:
+        host, port_s = s.rsplit(":", 1)
+        return Dest(host=host.strip(), port=int(port_s))
+    return Dest(host=s.strip(), port=ESP32_PORT)
+
+
+def run(live_only: bool, dests: List[Dest]):
     ir = irsdk.IRSDK()
     ir.startup()
 
@@ -68,7 +139,9 @@ def run(live_only: bool):
                 fieldnames=[
                     "ts_unix", "seq",
                     "rpm", "gear", "throttle", "brake", "steer_norm",
+                    "session_remain_s",
                     "fuel_l", "fuel_pct", "speed_kmh",
+                    "incidents",
                     "lap", "pos", "class_pos",
                     "lap_cur", "lap_last", "lap_best",
                     "is_replay",
@@ -79,7 +152,8 @@ def run(live_only: bool):
         else:
             print("[+] Live mode: CSV logging disabled (-l)")
 
-        print(f"[+] Sending UDP to {ESP32_IP}:{ESP32_PORT} @ {SEND_HZ:.1f} Hz")
+        dest_str = ", ".join([f"{d.host}:{d.port}" for d in dests])
+        print(f"[+] Sending UDP to: {dest_str} @ {SEND_HZ:.1f} Hz")
         print("[i] Start iRacing and get in-car to see live values.")
 
         while True:
@@ -101,16 +175,20 @@ def run(live_only: bool):
             throttle = float(ir_get(ir, "Throttle", 0.0))   # 0..1
             brake = float(ir_get(ir, "Brake", 0.0))         # 0..1
 
-            # Steering normalization
+            # Steering normalization (kept for CSV/debug, NOT sent)
             steer_angle = float(ir_get(ir, "SteeringWheelAngle", 0.0))
             steer_max = float(ir_get(ir, "SteeringWheelAngleMax", 0.0))
             steer_norm = (steer_angle / steer_max) if steer_max not in (0.0, None) else 0.0
 
+            # Session remaining + incidents (NEW, sent)
+            session_remain_s = float(get_session_time_remain(ir))
+            incidents = int(get_incidents(ir))
+
             # Fuel + speed
             fuel_l = float(ir_get(ir, "FuelLevel", 0.0))
-            fuel_pct = norm_pct(ir_get(ir, "FuelLevelPct", 0.0))
+            fuel_pct = norm_pct(ir_get(ir, "FuelLevelPct", 0.0))  # kept for CSV/debug
 
-            speed_ms = float(ir_get(ir, "Speed", 0.0))       # m/s
+            speed_ms = float(ir_get(ir, "Speed", 0.0))  # m/s
             speed_kmh = speed_ms * 3.6
 
             # Lap + position (prefer PlayerCar..., fallback to CarIdx... especially in replay)
@@ -138,16 +216,23 @@ def run(live_only: bool):
                 if lap_best <= 0.0:
                     lap_best = float(ir_get_idx(ir, "CarIdxBestLapTime", player_idx, lap_best))
 
-            # UDP payload (15 values):
-            # seq,rpm,gear,thr,brk,steer,fuel_l,fuel_pct,speed_kmh,lap,pos,class_pos,lap_cur,lap_last,lap_best
+            # UDP payload (15 values) — MUST match ESP32 parse order:
+            # seq,rpm,gear,thr,brk,session_remain_s,fuel_l,incidents,speed_kmh,lap,pos,class_pos,lap_cur,lap_last,lap_best
             payload = (
                 f"{seq},{rpm:.1f},{gear},"
-                f"{throttle:.3f},{brake:.3f},{steer_norm:.3f},"
-                f"{fuel_l:.3f},{fuel_pct:.4f},{speed_kmh:.2f},"
+                f"{throttle:.3f},{brake:.3f},{session_remain_s:.2f},"
+                f"{fuel_l:.3f},{incidents},"
+                f"{speed_kmh:.2f},"
                 f"{lap},{pos},{class_pos},"
                 f"{lap_cur:.3f},{lap_last:.3f},{lap_best:.3f}"
-            )
-            sock.sendto(payload.encode("ascii"), (ESP32_IP, ESP32_PORT))
+            ).encode("ascii", errors="ignore")
+
+            # Send to all destinations (ESP32, Pi, etc.)
+            for d in dests:
+                resolved = d.resolve(interval_s=5.0)
+                if resolved is None:
+                    continue
+                sock.sendto(payload, resolved)
 
             # Optional CSV logging
             if writer is not None:
@@ -159,9 +244,11 @@ def run(live_only: bool):
                     "throttle": throttle,
                     "brake": brake,
                     "steer_norm": steer_norm,
+                    "session_remain_s": session_remain_s,
                     "fuel_l": fuel_l,
                     "fuel_pct": fuel_pct,
                     "speed_kmh": speed_kmh,
+                    "incidents": incidents,
                     "lap": lap,
                     "pos": pos,
                     "class_pos": class_pos,
@@ -177,6 +264,8 @@ def run(live_only: bool):
                 print(
                     f"seq={seq:7d} rpm={rpm:7.0f} gear={gear:2d} "
                     f"spd={speed_kmh:6.1f}kmh fuel={fuel_l:6.2f}L ({fuel_pct*100:5.1f}%) "
+                    f"inc={incidents:2d} "
+                    f"remain={session_remain_s:7.1f}s "
                     f"lap={lap:3d} pos={pos:3d} cls={class_pos:3d} "
                     f"cur={lap_cur:7.3f} last={lap_last:7.3f} best={lap_best:7.3f} "
                     f"thr={throttle:4.2f} brk={brake:4.2f} replay={is_replay}"
@@ -202,14 +291,26 @@ def run(live_only: bool):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="iRacing -> UDP (ESP32) + optional CSV logger")
+    parser = argparse.ArgumentParser(description="iRacing -> UDP (ESP32/Pi) + optional CSV logger")
     parser.add_argument(
         "-l", "--live",
         action="store_true",
         help="Live-only mode: do not write CSV to disk"
     )
+    parser.add_argument(
+        "--dest",
+        action="append",
+        default=[],
+        help='UDP destination "host" or "host:port". Can be used multiple times.'
+    )
     args = parser.parse_args()
-    run(live_only=args.live)
+
+    if args.dest:
+        dests = [parse_dest(x) for x in args.dest]
+    else:
+        dests = [Dest(host=ESP32_IP, port=ESP32_PORT)]
+
+    run(live_only=args.live, dests=dests)
 
 
 if __name__ == "__main__":
